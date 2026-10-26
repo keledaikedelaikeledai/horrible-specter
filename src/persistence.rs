@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::id,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -194,6 +195,17 @@ impl Database {
                    VALUES (3, strftime('%s', 'now'));",
             )?;
             tx.commit()?;
+            version = 3;
+        }
+        if version < 4 {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE workspace_leases ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE workspace_leases ADD COLUMN owner_token TEXT NOT NULL DEFAULT '';
+                 INSERT INTO schema_migrations(version, applied_at)
+                   VALUES (4, strftime('%s', 'now'));",
+            )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -279,7 +291,7 @@ impl Database {
             "SELECT id, conversation_id, sequence, kind, role, content, event_key,
                     event_scope, provider_session_id, tool_call_id, message_id,
                     operation_status, metadata_json, created_at
-             FROM events WHERE conversation_id = ?1 ORDER BY sequence",
+             FROM events WHERE conversation_id = ?1 ORDER BY sequence, id",
         )?;
         let rows = statement.query_map(params![conversation_id], event_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -318,10 +330,35 @@ impl Database {
         native_session_id: Option<&str>,
     ) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
+        let current_pid = id() as i64;
+        if let Some((owner_run_id, owner_pid)) = tx
+            .query_row(
+                "SELECT run_id, owner_pid FROM workspace_leases WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            match process_alive(owner_pid) {
+                Some(false) => {
+                    tx.execute(
+                        "DELETE FROM workspace_leases WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                }
+                Some(true) => anyhow::bail!(
+                    "workspace is owned by live provider run {owner_run_id} (pid {owner_pid})"
+                ),
+                None => anyhow::bail!(
+                    "workspace lease owner cannot be verified; explicitly release run {owner_run_id} before retrying"
+                ),
+            }
+        }
+        let owner_token = format!("{current_pid}:{run_id}:{}", now());
         let acquired = tx.execute(
-            "INSERT INTO workspace_leases(project_id, run_id, provider, acquired_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, run_id, provider, now()],
+            "INSERT INTO workspace_leases(project_id, run_id, provider, acquired_at, owner_pid, owner_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project_id, run_id, provider, now(), current_pid, owner_token],
         );
         if let Err(error) = acquired {
             anyhow::bail!("workspace is already owned by another provider run: {error}");
@@ -348,6 +385,14 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Explicit recovery path for a lease whose process cannot be verified.
+    pub fn release_workspace_lease(&self, project_id: i64, run_id: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM workspace_leases WHERE project_id = ?1 AND run_id = ?2",
+            params![project_id, run_id],
+        )? > 0)
     }
 
     pub fn append_message(
@@ -400,6 +445,8 @@ impl Database {
                 || existing.role.as_deref() != event.role
                 || existing.content.as_deref() != event.content
                 || existing.provider_session_id.as_deref() != event.provider_session_id
+                || existing.tool_call_id.as_deref() != event.tool_call_id
+                || existing.message_id.as_deref() != event.message_id
                 || existing.operation_status.as_deref() != event.operation_status
                 || existing.metadata_json.as_deref() != event.metadata_json
             {
@@ -480,6 +527,25 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<EventRecord> {
         metadata_json: row.get(12)?,
         created_at: row.get(13)?,
     })
+}
+
+fn process_alive(pid: i64) -> Option<bool> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match fs::metadata(format!("/proc/{pid}")) {
+            Ok(_) => Some(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn now() -> i64 {
@@ -702,6 +768,28 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(
+            first
+                .append_event(
+                    conversation.id,
+                    EventInput {
+                        tool_call_id: Some("call-1"),
+                        ..event
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            first
+                .append_event(
+                    conversation.id,
+                    EventInput {
+                        message_id: Some("message-1"),
+                        ..event
+                    },
+                )
+                .is_err()
+        );
         first.start_provider_run(
             project.id,
             conversation.id,
@@ -717,6 +805,26 @@ mod tests {
         );
         first.finish_provider_run(project.id, "run-1", "interrupted")?;
         second.start_provider_run(project.id, conversation.id, "run-2", "codex", None)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dead_owner_can_be_recovered_without_age_based_stealing() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("project");
+        fs::create_dir_all(&root)?;
+        let first = Database::open(&root)?;
+        let project = first.ensure_project(&root)?;
+        let conversation = first.create_conversation(project.id, "Recovery")?;
+        first.start_provider_run(project.id, conversation.id, "dead-run", "claude", None)?;
+        first.connection.execute(
+            "UPDATE workspace_leases SET owner_pid = 4294967295 WHERE project_id = ?1",
+            params![project.id],
+        )?;
+
+        let second = Database::open(&root)?;
+        second.start_provider_run(project.id, conversation.id, "new-run", "codex", None)?;
         Ok(())
     }
 }
