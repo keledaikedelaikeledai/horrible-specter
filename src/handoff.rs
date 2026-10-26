@@ -21,9 +21,18 @@ pub struct HandoffContext {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextEvent {
+    pub event_id: i64,
+    pub kind: String,
+    pub event_key: Option<String>,
+    pub event_scope: String,
     pub role: String,
     pub content: String,
     pub sequence: i64,
+    pub provider_session_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub message_id: Option<String>,
+    pub operation_status: Option<String>,
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

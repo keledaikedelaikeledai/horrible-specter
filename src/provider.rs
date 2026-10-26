@@ -34,6 +34,7 @@ pub struct ProviderRequest {
     pub prompt: String,
     pub model: Option<String>,
     pub session: SessionRequest,
+    pub run_id: String,
     pub application_context: ApplicationContext,
 }
 
@@ -65,6 +66,7 @@ pub struct ProviderSession {
 
 #[derive(Debug)]
 pub struct ProviderRun {
+    pub run_id: String,
     pub session: ProviderSession,
     pub events: mpsc::Receiver<ProviderEvent>,
 }
@@ -74,7 +76,16 @@ pub struct ProviderEvent {
     /// Stable provider event identity used for idempotent persistence.
     pub event_id: String,
     pub provider_session_id: String,
+    pub run_id: String,
+    pub message_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub kind: ProviderEventKind,
+}
+
+impl ProviderEvent {
+    pub fn event_scope(&self) -> String {
+        format!("{}:{}", self.run_id, self.provider_session_id)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -223,6 +234,9 @@ mod tests {
         let event = ProviderEvent {
             event_id: "tool-1-finish".to_string(),
             provider_session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            message_id: None,
+            tool_call_id: Some("call-1".to_string()),
             kind: ProviderEventKind::ToolFinished {
                 call_id: "call-1".to_string(),
                 status: OperationStatus::Partial,
