@@ -130,7 +130,13 @@ fn draw_center(app: &App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ·  ", Style::default().fg(MUTED)),
-            Span::styled(app.providers.active_label(), Style::default().fg(WARNING)),
+            Span::styled(
+                app.providers
+                    .active_model()
+                    .map(|model| format!("{} / {model}", app.providers.active_label()))
+                    .unwrap_or_else(|| app.providers.active_label().to_string()),
+                Style::default().fg(WARNING),
+            ),
         ]),
         Line::from(Span::styled(
             "Application history is available across providers",

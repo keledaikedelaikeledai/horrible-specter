@@ -48,6 +48,31 @@ pub struct App {
 }
 
 impl App {
+    pub async fn discover_opencode(&mut self) {
+        match crate::opencode::OpenCodeClient::local() {
+            Ok(client) => match client.health().await {
+                Ok(version) => match client.providers().await {
+                    Ok(descriptors) if !descriptors.is_empty() => {
+                        self.providers = ProviderRegistry::from_descriptors(descriptors);
+                        self.status_message =
+                            format!("OpenCode {version} connected; model available");
+                    }
+                    Ok(_) => {
+                        self.status_message =
+                            format!("OpenCode {version} connected; no models configured")
+                    }
+                    Err(error) => {
+                        self.status_message = format!("OpenCode provider discovery failed: {error}")
+                    }
+                },
+                Err(error) => self.status_message = format!("OpenCode connection failed: {error}"),
+            },
+            Err(error) => self.status_message = format!("OpenCode setup failed: {error}"),
+        }
+    }
+}
+
+impl App {
     pub fn load(project_root: PathBuf, database: Database) -> Result<Self> {
         let project = database.ensure_project(&project_root)?;
         let mut conversations = database.list_conversations(project.id)?;

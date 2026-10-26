@@ -213,11 +213,21 @@ impl ProviderRegistry {
         &self.descriptors
     }
 
+    pub fn from_descriptors(descriptors: Vec<ProviderDescriptor>) -> Self {
+        Self { descriptors }
+    }
+
     pub fn active_label(&self) -> &str {
         self.descriptors
             .first()
             .map(|provider| provider.display_name.as_str())
             .unwrap_or("No provider configured")
+    }
+
+    pub fn active_model(&self) -> Option<&str> {
+        self.descriptors
+            .first()
+            .and_then(|provider| provider.model.as_deref())
     }
 }
 

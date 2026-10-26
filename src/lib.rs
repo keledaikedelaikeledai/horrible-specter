@@ -1,6 +1,7 @@
 pub mod app;
 pub mod handoff;
 pub mod input;
+pub mod opencode;
 pub mod persistence;
 pub mod provider;
 pub mod terminal;

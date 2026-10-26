@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
 
     let database = Database::open(&project)?;
     let mut app = App::load(project, database)?;
+    app.discover_opencode().await;
     let _terminal = TerminalGuard::enter()?;
     app.run().await
 }
