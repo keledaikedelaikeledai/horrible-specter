@@ -1,8 +1,8 @@
 # Serangkai architecture
 
 Serangkai keeps application-owned conversation history separate from provider
-native state. Providers will eventually stream observable events into the
-application; they do not own the conversation or the workspace lifecycle.
+native state. OpenCode streams observable events into the application; it does
+not own the conversation or the workspace lifecycle.
 
 ## Runtime flow
 
@@ -11,18 +11,24 @@ terminal input -> input mapping -> App state -> Ratatui renderer
                        |                 |
                        |                 +-> SQLite event recorder
                        |
-                       +-> provider adapter (future)
+                       +-> OpenCode HTTP/SSE adapter
 
 Tokio event loop -> bounded workspace refresh requests
-                 -> one refresh worker
-                 -> spawn_blocking(git)
-                 -> latest WorkspaceStatus
+                  -> one refresh worker
+                  -> spawn_blocking(git)
+                  -> latest WorkspaceStatus
+
+                 -> provider run task
+                    -> OpenCode session and prompt requests
+                    -> SSE event stream
+                    -> spawn_blocking SQLite event persistence
 ```
 
-The TUI does not execute provider-specific logic. `src/app.rs` coordinates
-state changes, `src/input.rs` maps keyboard events, and `src/ui.rs` renders the
-state. Git commands run in a single coalescing worker so a slow refresh cannot
-block input or overlap another refresh.
+The TUI does not execute provider-specific protocol logic. `src/app.rs`
+coordinates state changes, `src/input.rs` maps keyboard events, and `src/ui.rs`
+renders the state. Git commands run in a single coalescing worker so a slow
+refresh cannot block input or overlap another refresh. OpenCode network work
+and provider event persistence run outside the TUI input path.
 
 ## Persistence
 
@@ -44,7 +50,7 @@ stream events to be ingested idempotently.
 
 ## Provider contract
 
-`src/provider.rs` defines the boundary for future adapters:
+`src/provider.rs` defines the boundary used by the OpenCode adapter:
 
 - `SessionRequest` supports new and native-session resume flows.
 - `ApplicationContext` carries application-owned history independently of
@@ -56,13 +62,21 @@ stream events to be ingested idempotently.
 - `OperationStatus::Partial` and `OperationStatus::Uncertain` preserve the
   fact that a tool or provider operation may not have reached a clean end.
 
-No provider integration is included in this milestone.
+`src/opencode.rs` uses the documented `/global/health`, `/provider`,
+`/session`, `/session/:id/prompt_async`, and `/event` endpoints. The adapter
+subscribes to `/event` before submitting a prompt, filters events to its native
+session, and waits for `session.idle` before completing a run.
 
 ## Workspace safety
 
 Git integration is read-only. It reports porcelain status, staged diff,
 unstaged diff, branch information, and a bounded preview. Serangkai does not
 stage, reset, checkout, clean, write, or discard workspace files.
+
+Provider runs acquire an exclusive SQLite workspace lease with the owning
+process identity. A live owner blocks another run; a verified dead owner is
+marked interrupted and recovered. If ownership cannot be verified, the lease
+requires explicit release by run ID rather than age-based stealing.
 
 ## Handoff boundary
 

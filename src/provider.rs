@@ -202,6 +202,7 @@ pub trait Provider: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderRegistry {
     descriptors: Vec<ProviderDescriptor>,
+    active: usize,
 }
 
 impl ProviderRegistry {
@@ -214,20 +215,37 @@ impl ProviderRegistry {
     }
 
     pub fn from_descriptors(descriptors: Vec<ProviderDescriptor>) -> Self {
-        Self { descriptors }
+        Self {
+            descriptors,
+            active: 0,
+        }
     }
 
     pub fn active_label(&self) -> &str {
         self.descriptors
-            .first()
+            .get(self.active)
             .map(|provider| provider.display_name.as_str())
             .unwrap_or("No provider configured")
     }
 
     pub fn active_model(&self) -> Option<&str> {
         self.descriptors
-            .first()
+            .get(self.active)
             .and_then(|provider| provider.model.as_deref())
+    }
+
+    pub fn active_descriptor(&self) -> Option<&ProviderDescriptor> {
+        self.descriptors.get(self.active)
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn select(&mut self, index: usize) {
+        if index < self.descriptors.len() {
+            self.active = index;
+        }
     }
 }
 

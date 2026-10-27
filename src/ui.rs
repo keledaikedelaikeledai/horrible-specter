@@ -57,7 +57,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
     }
     draw_status(app, frame, status);
     if let Some(overlay) = &app.overlay {
-        draw_overlay(frame, area, overlay);
+        draw_overlay(app, frame, area, overlay);
     }
 }
 
@@ -158,7 +158,7 @@ fn draw_center(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(MUTED),
         )));
         lines.push(Line::from(Span::styled(
-            "Press i to compose a message. Provider execution is not configured.",
+            "Press i to compose a message. OpenCode streams responses when connected.",
             Style::default().fg(MUTED),
         )));
     } else {
@@ -182,6 +182,12 @@ fn draw_center(app: &App, frame: &mut Frame, area: Rect) {
                 ]));
             }
             lines.push(Line::from(""));
+        }
+        for activity in &app.activities {
+            lines.push(Line::from(Span::styled(
+                format!("  ◇ {activity}"),
+                Style::default().fg(WARNING),
+            )));
         }
     }
     let message_height = layout[1].height as usize;
@@ -371,12 +377,12 @@ fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
+fn draw_overlay(app: &App, frame: &mut Frame, area: Rect, overlay: &Overlay) {
     let width = area.width.min(72).saturating_sub(2);
     let height = match overlay {
         Overlay::Help => 15,
         Overlay::Palette { .. } => 9,
-        Overlay::ProviderSelector => 8,
+        Overlay::ProviderSelector { .. } => (app.providers.descriptors().len() as u16 + 4).min(20),
     };
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
@@ -395,7 +401,10 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                 "Ctrl+d    toggle workspace sidebar",
                 "?         show this help",
                 "q         quit in normal mode",
-            ],
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             None,
         ),
         Overlay::Palette { selected } => (
@@ -404,18 +413,30 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                 "New conversation",
                 "Toggle project sidebar",
                 "Toggle workspace sidebar",
-            ],
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             Some(*selected),
         ),
-        Overlay::ProviderSelector => (
-            " PROVIDERS ",
-            vec![
-                "No providers configured.",
-                "Provider integrations will appear here when configured.",
-                "Esc       close",
-            ],
-            None,
-        ),
+        Overlay::ProviderSelector { selected } => {
+            let lines = if app.providers.descriptors().is_empty() {
+                vec!["No OpenCode models configured.".to_string()]
+            } else {
+                app.providers
+                    .descriptors()
+                    .iter()
+                    .map(|provider| {
+                        format!(
+                            "{} / {}",
+                            provider.display_name,
+                            provider.model.as_deref().unwrap_or("default")
+                        )
+                    })
+                    .collect()
+            };
+            (" OPENCODE MODELS ", lines, Some(*selected))
+        }
     };
     let text = lines
         .into_iter()
@@ -430,7 +451,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
                 if selected.is_some() {
                     format!("  {line}")
                 } else {
-                    line.to_string()
+                    line
                 },
                 style,
             ))

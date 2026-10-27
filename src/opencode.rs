@@ -1,6 +1,6 @@
-use std::env;
+use std::{env, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, Response, StatusCode, header};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -21,7 +21,7 @@ impl OpenCodeClient {
     pub fn local() -> Result<Self> {
         let base_url =
             env::var("OPENCODE_URL").unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
-        let mut builder = Client::builder();
+        let mut builder = Client::builder().connect_timeout(Duration::from_secs(2));
         if let Ok(password) = env::var("OPENCODE_SERVER_PASSWORD") {
             let username =
                 env::var("OPENCODE_SERVER_USERNAME").unwrap_or_else(|_| "opencode".to_string());
@@ -48,6 +48,9 @@ impl OpenCodeClient {
 
     pub async fn health(&self) -> Result<String> {
         let value = self.get("/global/health").await?;
+        if value.get("healthy").and_then(Value::as_bool) == Some(false) {
+            bail!("OpenCode server reported unhealthy");
+        }
         value
             .get("version")
             .and_then(Value::as_str)
@@ -61,26 +64,67 @@ impl OpenCodeClient {
             .get("all")
             .and_then(Value::as_array)
             .context("OpenCode provider response did not include all")?;
-        Ok(all
+        let connected = value
+            .get("connected")
+            .and_then(Value::as_array)
+            .map(|providers| {
+                providers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+            });
+        let mut descriptors = all
             .iter()
-            .filter_map(|provider| {
-                let id = provider.get("id")?.as_str()?.to_string();
+            .filter(|provider| {
+                let id = provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                connected
+                    .as_ref()
+                    .is_none_or(|providers| providers.contains(&id))
+            })
+            .flat_map(|provider| {
+                let id = provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let display_name = provider
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or(&id)
                     .to_string();
-                let models = provider.get("models").and_then(Value::as_object);
-                models
-                    .and_then(|models| models.iter().next())
-                    .map(|(model, _)| ProviderDescriptor {
-                        id,
-                        display_name,
-                        model: Some(model.clone()),
-                        capabilities: Default::default(),
+                provider
+                    .get("models")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(move |models| {
+                        models.keys().map({
+                            let id = id.clone();
+                            let display_name = display_name.clone();
+                            move |model| ProviderDescriptor {
+                                id: id.clone(),
+                                display_name: display_name.clone(),
+                                model: Some(model.clone()),
+                                capabilities: crate::provider::ProviderCapabilities {
+                                    streaming_messages: true,
+                                    tool_events: true,
+                                    interruption: true,
+                                    native_session_resume: true,
+                                    usage_limits: true,
+                                },
+                            }
+                        })
                     })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        Ok(descriptors)
     }
 
     async fn create_session(&self, title: &str) -> Result<String> {
@@ -121,6 +165,18 @@ impl OpenCodeClient {
         }
     }
 
+    pub async fn abort_session(&self, session_id: &str) -> Result<bool> {
+        let value = self
+            .request(
+                self.http
+                    .post(self.url(&format!("/session/{session_id}/abort"))),
+            )
+            .await?;
+        value
+            .as_bool()
+            .context("OpenCode abort response did not include a boolean result")
+    }
+
     async fn event_stream(&self) -> Result<Response> {
         let response = self.http.get(self.url("/event")).send().await?;
         if response.status().is_success() {
@@ -145,7 +201,7 @@ impl OpenCodeClient {
     async fn status_error(&self, response: Response) -> anyhow::Error {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        let message = if status == StatusCode::UNAUTHORIZED {
+        let message = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             "OpenCode authentication failed".to_string()
         } else {
             format!("OpenCode request failed ({status}): {body}")
@@ -168,6 +224,7 @@ impl OpenCodeClient {
                 native_session_id.clone()
             }
         };
+        let response = self.event_stream().await?;
         let (sender, events) = mpsc::channel(128);
         let client = self.clone();
         let run_id = request.run_id.clone();
@@ -182,50 +239,38 @@ impl OpenCodeClient {
                     ProviderEventKind::SessionStarted,
                 ))
                 .await;
-            let prompt = client.prompt_async(&session_for_task, &request);
-            let mut prompt = Box::pin(prompt);
-            let mut response = match client.event_stream().await {
-                Ok(response) => response,
-                Err(error) => {
-                    let _ = sender
-                        .send(failed_event(
-                            &task_run_id,
-                            &session_for_task,
-                            error.to_string(),
-                        ))
-                        .await;
-                    return;
-                }
-            };
+            let mut response = response;
+            let mut prompt = Box::pin(client.prompt_async(&session_for_task, &request));
             let mut buffer = Vec::new();
             let mut prompt_done = false;
-            while !prompt_done {
+            let mut completed = false;
+            while !completed {
                 tokio::select! {
-                    result = &mut prompt => {
+                    result = &mut prompt, if !prompt_done => {
                         if let Err(error) = result { let _ = sender.send(failed_event(&task_run_id, &session_for_task, error.to_string())).await; return; }
                         prompt_done = true;
                     }
                     chunk = response.chunk() => match chunk {
                         Ok(Some(chunk)) => {
                             buffer.extend_from_slice(&chunk);
-                            while let Some(position) = buffer.windows(2).position(|window| window == b"\n\n") {
-                                let frame = buffer.drain(..position + 2).collect::<Vec<_>>();
-                                if let Some(event) = parse_sse(&frame, &task_run_id, &session_for_task) { let _ = sender.send(event).await; }
+                            while let Some(frame_length) = sse_frame_length(&buffer) {
+                                let frame = buffer.drain(..frame_length).collect::<Vec<_>>();
+                                if let Some(event) = parse_sse(&frame, &task_run_id, &session_for_task) {
+                                    completed = matches!(event.kind, ProviderEventKind::Completed | ProviderEventKind::Failed { .. } | ProviderEventKind::Interrupted);
+                                    let _ = sender.send(event).await;
+                                }
                             }
                         }
-                        Ok(None) => { let _ = sender.send(failed_event(&task_run_id, &session_for_task, "OpenCode event stream ended".to_string())).await; return; }
+                        Ok(None) => {
+                            if !completed {
+                                let _ = sender.send(failed_event(&task_run_id, &session_for_task, "OpenCode event stream ended before the session became idle".to_string())).await;
+                            }
+                            return;
+                        }
                         Err(error) => { let _ = sender.send(failed_event(&task_run_id, &session_for_task, error.to_string())).await; return; }
                     }
                 }
             }
-            let _ = sender
-                .send(event(
-                    &task_run_id,
-                    &session_for_task,
-                    "session.completed",
-                    ProviderEventKind::Completed,
-                ))
-                .await;
         });
         Ok(ProviderRun {
             run_id,
@@ -243,6 +288,16 @@ pub struct OpenCodeProvider {
     descriptor: ProviderDescriptor,
 }
 
+pub fn classify_error(error: anyhow::Error) -> ProviderError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("authentication") || lower.contains("unauthorized") || lower.contains("401") {
+        ProviderError::Authentication { message }
+    } else {
+        ProviderError::Transport { message }
+    }
+}
+
 impl OpenCodeProvider {
     pub fn new(client: OpenCodeClient, descriptor: ProviderDescriptor) -> Self {
         Self { client, descriptor }
@@ -254,23 +309,25 @@ impl Provider for OpenCodeProvider {
         self.descriptor.clone()
     }
     fn start<'a>(&'a self, request: ProviderRequest) -> ProviderFuture<'a, ProviderRun> {
-        Box::pin(async move {
-            self.client
-                .start_run(request)
-                .await
-                .map_err(|error| ProviderError::Transport {
-                    message: error.to_string(),
-                })
-        })
+        Box::pin(async move { self.client.start_run(request).await.map_err(classify_error) })
     }
     fn interrupt<'a>(
         &'a self,
-        _session: &'a ProviderSession,
+        session: &'a ProviderSession,
     ) -> ProviderFuture<'a, InterruptResult> {
-        Box::pin(async {
+        Box::pin(async move {
+            let acknowledged = self
+                .client
+                .abort_session(&session.provider_session_id)
+                .await
+                .map_err(classify_error)?;
             Ok(InterruptResult {
-                provider_acknowledged: false,
-                final_status: OperationStatus::Uncertain,
+                provider_acknowledged: acknowledged,
+                final_status: if acknowledged {
+                    OperationStatus::Interrupted
+                } else {
+                    OperationStatus::Uncertain
+                },
             })
         })
     }
@@ -317,12 +374,33 @@ pub fn parse_sse(frame: &[u8], run_id: &str, session_id: &str) -> Option<Provide
     map_event(&value, run_id, session_id)
 }
 
+fn sse_frame_length(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| position + 2)
+        .or_else(|| {
+            buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+        })
+}
+
 fn map_event(value: &Value, run_id: &str, session_id: &str) -> Option<ProviderEvent> {
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let properties = value.get("properties").unwrap_or(&Value::Null);
+    if event_type.starts_with("server.")
+        || properties
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .is_none_or(|event_session| event_session != session_id)
+    {
+        return None;
+    }
     let event_id = value
         .get("id")
         .and_then(Value::as_str)
@@ -334,8 +412,10 @@ fn map_event(value: &Value, run_id: &str, session_id: &str) -> Option<ProviderEv
                 serde_json::to_string(properties).unwrap_or_default()
             )
         });
+    let part = properties.get("part");
     let message_id = properties
         .get("messageID")
+        .or_else(|| part.and_then(|part| part.get("messageID")))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let tool_call_id = properties
@@ -346,32 +426,77 @@ fn map_event(value: &Value, run_id: &str, session_id: &str) -> Option<ProviderEv
     let kind = if event_type == "session.idle" {
         ProviderEventKind::Completed
     } else if event_type == "session.error" {
-        ProviderEventKind::Failed {
-            error: ProviderError::Failed {
-                message: properties.to_string(),
-            },
+        let message = properties
+            .get("error")
+            .or_else(|| properties.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| properties.to_string());
+        let lower = message.to_ascii_lowercase();
+        let error = if lower.contains("auth") || lower.contains("unauthorized") {
+            ProviderError::Authentication { message }
+        } else {
+            ProviderError::Failed { message }
+        };
+        ProviderEventKind::Failed { error }
+    } else if event_type == "message.part.delta" {
+        if properties.get("field").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        ProviderEventKind::MessageDelta {
+            role: MessageRole::Assistant,
+            content: properties
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         }
     } else if event_type == "message.part.updated" {
         let part = properties.get("part")?;
         match part.get("type").and_then(Value::as_str) {
-            Some("text") => ProviderEventKind::MessageDelta {
-                role: MessageRole::Assistant,
-                content: part
-                    .get("text")
+            Some("text") => return None,
+            Some("tool") => {
+                let state = part.get("state").unwrap_or(&Value::Null);
+                let status = state
+                    .get("status")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            },
-            Some("tool") => ProviderEventKind::ToolOutput {
-                call_id: tool_call_id.clone().unwrap_or_default(),
-                output: part.to_string(),
-                is_final: part
-                    .get("state")
-                    .and_then(|state| state.get("status"))
-                    .and_then(Value::as_str)
-                    .map(|status| status != "running")
-                    .unwrap_or(false),
-            },
+                    .unwrap_or("running");
+                let call_id = tool_call_id.clone().unwrap_or_default();
+                if matches!(status, "pending" | "running") {
+                    ProviderEventKind::ToolStarted {
+                        call_id,
+                        name: part
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                        input: state
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                            .to_string(),
+                    }
+                } else if status == "completed" {
+                    ProviderEventKind::ToolOutput {
+                        call_id,
+                        output: state
+                            .get("output")
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                            .to_string(),
+                        is_final: true,
+                    }
+                } else {
+                    ProviderEventKind::ToolFinished {
+                        call_id,
+                        status: OperationStatus::Failed,
+                        error: state
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    }
+                }
+            }
             _ => ProviderEventKind::Notice {
                 message: part.to_string(),
             },
@@ -417,14 +542,154 @@ fn base64_basic(value: &header::HeaderValue) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Notify,
+        time::{Duration, timeout},
+    };
     #[test]
     fn maps_documented_text_and_tool_events() {
-        let frame = br#"data: {"type":"message.part.updated","properties":{"messageID":"m1","part":{"type":"text","text":"hello"}}}
+        let frame = br#"data: {"id":"evt-1","type":"message.part.delta","properties":{"sessionID":"session-1","messageID":"m1","partID":"p1","field":"text","delta":"hello"}}
 
 "#;
         let event = parse_sse(frame, "run-1", "session-1").unwrap();
+        assert_eq!(event.event_id, "evt-1");
         assert_eq!(event.message_id.as_deref(), Some("m1"));
         assert!(matches!(event.kind, ProviderEventKind::MessageDelta { .. }));
+    }
+
+    #[test]
+    fn maps_tool_state_and_ignores_other_sessions() {
+        let frame = br#"data: {"id":"evt-tool","type":"message.part.updated","properties":{"sessionID":"session-1","messageID":"m1","part":{"type":"tool","callID":"call-1","tool":"bash","state":{"status":"running","input":{"command":"ls"}}}}}
+
+"#;
+        let event = parse_sse(frame, "run-1", "session-1").unwrap();
+        assert!(matches!(event.kind, ProviderEventKind::ToolStarted { .. }));
+
+        let other = br#"data: {"type":"session.idle","properties":{"sessionID":"other"}}
+
+"#;
+        assert!(parse_sse(other, "run-1", "session-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn streams_events_from_documented_fixture_routes() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let prompt_received = Arc::new(Notify::new());
+        let server_prompt_received = Arc::clone(&prompt_received);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let prompt_received = Arc::clone(&server_prompt_received);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let count = stream.read(&mut chunk).await.ok()?;
+                        if count == 0 {
+                            return Some(());
+                        }
+                        request.extend_from_slice(&chunk[..count]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()?
+                        .split_whitespace()
+                        .nth(1)?
+                        .to_string();
+                    if path == "/event" {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+                            )
+                            .await
+                            .ok()?;
+                        stream
+                            .write_all(
+                                b"data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+                            )
+                            .await
+                            .ok()?;
+                        prompt_received.notified().await;
+                        stream
+                            .write_all(
+                                b"data: {\"id\":\"evt-delta\",\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"session-1\",\"messageID\":\"message-1\",\"field\":\"text\",\"delta\":\"hello\"}}\n\ndata: {\"id\":\"evt-tool\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"session-1\",\"part\":{\"type\":\"tool\",\"messageID\":\"message-1\",\"callID\":\"call-1\",\"tool\":\"bash\",\"state\":{\"status\":\"running\",\"input\":{\"command\":\"pwd\"}}}}}\n\ndata: {\"id\":\"evt-idle\",\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"session-1\"}}\n\n",
+                            )
+                            .await
+                            .ok()?;
+                        return Some(());
+                    }
+                    let (status, body) = if path == "/global/health" {
+                        ("200 OK", r#"{"healthy":true,"version":"fixture"}"#)
+                    } else if path == "/provider" {
+                        (
+                            "200 OK",
+                            r#"{"all":[{"id":"fixture","name":"Fixture","models":{"model-1":{}}}],"connected":["fixture"]}"#,
+                        )
+                    } else if path == "/session" {
+                        ("200 OK", r#"{"id":"session-1"}"#)
+                    } else if path.ends_with("/prompt_async") {
+                        prompt_received.notify_waiters();
+                        ("204 No Content", "")
+                    } else {
+                        ("404 Not Found", "not found")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.ok()?;
+                    Some(())
+                });
+            }
+        });
+
+        let client = OpenCodeClient::with_base_url(format!("http://{address}"))?;
+        assert_eq!(client.health().await?, "fixture");
+        assert_eq!(client.providers().await?.len(), 1);
+        let request = ProviderRequest {
+            conversation_id: 1,
+            prompt: "hello".to_string(),
+            model: Some("fixture/model-1".to_string()),
+            session: crate::provider::SessionRequest::New,
+            run_id: "run-fixture".to_string(),
+            application_context: Default::default(),
+        };
+        let mut run = client.start_run(request).await?;
+        let mut received = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_secs(3), run.events.recv()).await {
+            let terminal = matches!(event.kind, ProviderEventKind::Completed);
+            received.push(event);
+            if terminal {
+                break;
+            }
+        }
+        assert!(
+            received
+                .iter()
+                .any(|event| { matches!(event.kind, ProviderEventKind::MessageDelta { .. }) })
+        );
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event.kind, ProviderEventKind::ToolStarted { .. }))
+        );
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event.kind, ProviderEventKind::Completed))
+        );
+        server.abort();
+        Ok(())
     }
 }

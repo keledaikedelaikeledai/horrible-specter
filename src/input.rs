@@ -35,7 +35,7 @@ pub enum Mode {
 pub enum Overlay {
     Help,
     Palette { selected: usize },
-    ProviderSelector,
+    ProviderSelector { selected: usize },
 }
 
 impl Overlay {
@@ -114,11 +114,28 @@ pub fn compose_action(key: KeyEvent) -> Action {
 pub fn overlay_action(overlay: &Overlay, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::CloseOverlay,
-        KeyCode::Enter if matches!(overlay, Overlay::Palette { .. }) => Action::ActivateOverlay,
-        KeyCode::Char('j') | KeyCode::Down if matches!(overlay, Overlay::Palette { .. }) => {
+        KeyCode::Enter
+            if matches!(
+                overlay,
+                Overlay::Palette { .. } | Overlay::ProviderSelector { .. }
+            ) =>
+        {
+            Action::ActivateOverlay
+        }
+        KeyCode::Char('j') | KeyCode::Down
+            if matches!(
+                overlay,
+                Overlay::Palette { .. } | Overlay::ProviderSelector { .. }
+            ) =>
+        {
             Action::MoveOverlay(1)
         }
-        KeyCode::Char('k') | KeyCode::Up if matches!(overlay, Overlay::Palette { .. }) => {
+        KeyCode::Char('k') | KeyCode::Up
+            if matches!(
+                overlay,
+                Overlay::Palette { .. } | Overlay::ProviderSelector { .. }
+            ) =>
+        {
             Action::MoveOverlay(-1)
         }
         _ => Action::None,

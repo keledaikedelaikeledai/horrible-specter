@@ -32,6 +32,14 @@ pub struct MessageRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProviderSessionRecord {
+    pub provider: String,
+    pub native_session_id: Option<String>,
+    pub status: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct EventRecord {
     pub id: i64,
     pub conversation_id: i64,
@@ -272,18 +280,50 @@ impl Database {
     }
 
     pub fn list_messages(&self, conversation_id: i64) -> Result<Vec<MessageRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, role, content, created_at FROM events WHERE conversation_id = ?1 AND kind = 'message' ORDER BY sequence",
-        )?;
-        let rows = statement.query_map(params![conversation_id], |row| {
-            Ok(MessageRecord {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let events = self.list_events(conversation_id)?;
+        let mut messages = Vec::new();
+        let mut provider_messages = Vec::<(String, usize)>::new();
+        for event in events {
+            let Some(content) = event.content else {
+                continue;
+            };
+            if event.kind == "message" {
+                messages.push(MessageRecord {
+                    id: event.id,
+                    role: event.role.unwrap_or_else(|| "system".to_string()),
+                    content,
+                    created_at: event.created_at,
+                });
+                continue;
+            }
+            let is_delta = event.kind == "message.delta";
+            let is_completed = event.kind == "message.completed";
+            if !(is_delta || is_completed) {
+                continue;
+            }
+            let key = format!(
+                "{}:{}",
+                event.event_scope,
+                event.message_id.unwrap_or_else(|| "assistant".to_string())
+            );
+            if let Some((_, index)) = provider_messages.iter().find(|(known, _)| known == &key) {
+                let message = &mut messages[*index];
+                if is_completed {
+                    message.content = content;
+                } else {
+                    message.content.push_str(&content);
+                }
+            } else {
+                provider_messages.push((key, messages.len()));
+                messages.push(MessageRecord {
+                    id: event.id,
+                    role: event.role.unwrap_or_else(|| "assistant".to_string()),
+                    content,
+                    created_at: event.created_at,
+                });
+            }
+        }
+        Ok(messages)
     }
 
     pub fn list_events(&self, conversation_id: i64) -> Result<Vec<EventRecord>> {
@@ -331,16 +371,27 @@ impl Database {
     ) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
         let current_pid = id() as i64;
-        if let Some((owner_run_id, owner_pid)) = tx
+        if let Some((owner_run_id, owner_pid, owner_token)) = tx
             .query_row(
-                "SELECT run_id, owner_pid FROM workspace_leases WHERE project_id = ?1",
+                "SELECT run_id, owner_pid, owner_token FROM workspace_leases WHERE project_id = ?1",
                 params![project_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
         {
-            match process_alive(owner_pid) {
+            match process_alive(owner_pid, &owner_token) {
                 Some(false) => {
+                    tx.execute(
+                        "UPDATE provider_sessions SET status = 'interrupted', ended_at = ?1
+                         WHERE run_id = ?2 AND status = 'running'",
+                        params![now(), owner_run_id],
+                    )?;
                     tx.execute(
                         "DELETE FROM workspace_leases WHERE project_id = ?1",
                         params![project_id],
@@ -354,7 +405,8 @@ impl Database {
                 ),
             }
         }
-        let owner_token = format!("{current_pid}:{run_id}:{}", now());
+        let owner_token =
+            process_identity(current_pid).unwrap_or_else(|| format!("unverified:{current_pid}"));
         let acquired = tx.execute(
             "INSERT INTO workspace_leases(project_id, run_id, provider, acquired_at, owner_pid, owner_token)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -387,12 +439,59 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_provider_session_native_id(
+        &self,
+        run_id: &str,
+        native_session_id: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE provider_sessions SET native_session_id = ?1 WHERE run_id = ?2",
+            params![native_session_id, run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_provider_session(
+        &self,
+        conversation_id: i64,
+        provider: &str,
+    ) -> Result<Option<ProviderSessionRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT provider, native_session_id, status, run_id
+                 FROM provider_sessions
+                 WHERE conversation_id = ?1 AND provider = ?2 AND native_session_id IS NOT NULL
+                 ORDER BY started_at DESC, id DESC LIMIT 1",
+                params![conversation_id, provider],
+                |row| {
+                    Ok(ProviderSessionRecord {
+                        provider: row.get(0)?,
+                        native_session_id: row.get(1)?,
+                        status: row.get(2)?,
+                        run_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Explicit recovery path for a lease whose process cannot be verified.
     pub fn release_workspace_lease(&self, project_id: i64, run_id: &str) -> Result<bool> {
-        Ok(self.connection.execute(
+        let tx = self.connection.unchecked_transaction()?;
+        let released = tx.execute(
             "DELETE FROM workspace_leases WHERE project_id = ?1 AND run_id = ?2",
             params![project_id, run_id],
-        )? > 0)
+        )? > 0;
+        if released {
+            tx.execute(
+                "UPDATE provider_sessions SET status = 'interrupted', ended_at = ?1
+                 WHERE run_id = ?2 AND status = 'running'",
+                params![now(), run_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(released)
     }
 
     pub fn append_message(
@@ -529,14 +628,38 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<EventRecord> {
     })
 }
 
-fn process_alive(pid: i64) -> Option<bool> {
+fn process_identity(pid: i64) -> Option<String> {
     if pid <= 0 {
         return None;
     }
     #[cfg(target_os = "linux")]
     {
-        match fs::metadata(format!("/proc/{pid}")) {
-            Ok(_) => Some(true),
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let start_time = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()?
+            .trim()
+            .to_string();
+        Some(format!("{boot_id}:{start_time}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn process_alive(pid: i64, owner_token: &str) -> Option<bool> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if owner_token.is_empty() || owner_token.starts_with("unverified:") {
+            return None;
+        }
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(_) => Some(process_identity(pid).as_deref() == Some(owner_token)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
             Err(_) => None,
         }
@@ -736,6 +859,41 @@ mod tests {
     }
 
     #[test]
+    fn restart_reconstructs_streamed_assistant_message_from_deltas() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("project");
+        fs::create_dir_all(&root)?;
+        let mut database = Database::open(&root)?;
+        let project = database.ensure_project(&root)?;
+        let conversation = database.create_conversation(project.id, "Streaming")?;
+        for (key, content) in [("delta-1", "hel"), ("delta-2", "lo")] {
+            database.append_event(
+                conversation.id,
+                EventInput {
+                    kind: "message.delta",
+                    role: Some("assistant"),
+                    content: Some(content),
+                    event_key: Some(key),
+                    event_scope: Some("run-1:session-1"),
+                    provider_session_id: Some("session-1"),
+                    tool_call_id: None,
+                    message_id: Some("message-1"),
+                    operation_status: Some("running"),
+                    metadata_json: None,
+                    conversation_title: None,
+                },
+            )?;
+        }
+        drop(database);
+
+        let reopened = Database::open(&root)?;
+        let messages = reopened.list_messages(conversation.id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
+        Ok(())
+    }
+
+    #[test]
     fn conflicting_replay_is_rejected_and_workspace_ownership_is_exclusive() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("project");
@@ -817,7 +975,13 @@ mod tests {
         let first = Database::open(&root)?;
         let project = first.ensure_project(&root)?;
         let conversation = first.create_conversation(project.id, "Recovery")?;
-        first.start_provider_run(project.id, conversation.id, "dead-run", "claude", None)?;
+        first.start_provider_run(
+            project.id,
+            conversation.id,
+            "dead-run",
+            "claude",
+            Some("dead-native"),
+        )?;
         first.connection.execute(
             "UPDATE workspace_leases SET owner_pid = 4294967295 WHERE project_id = ?1",
             params![project.id],
@@ -825,6 +989,13 @@ mod tests {
 
         let second = Database::open(&root)?;
         second.start_provider_run(project.id, conversation.id, "new-run", "codex", None)?;
+        assert_eq!(
+            second
+                .latest_provider_session(conversation.id, "claude")?
+                .expect("recovered provider session")
+                .status,
+            "interrupted"
+        );
         Ok(())
     }
 }
